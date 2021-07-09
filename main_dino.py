@@ -51,7 +51,7 @@ try:
 except ImportError:
     accimage = None
 
-from torchvision.transforms import functional as F
+from torchvision.transforms import functional as torchvision_F
 from torchvision.transforms.functional import InterpolationMode, _interpolation_modes_from_int
 from torchvision.transforms import RandomResizedCrop
 
@@ -516,7 +516,7 @@ class QuarterRandomResizedCrop(RandomResizedCrop):
             sized crop.
             :param quarter:
         """
-        width, height = F._get_image_size(img)
+        width, height = torchvision_F._get_image_size(img)
         area = height * width
 
         log_ratio = torch.log(torch.tensor(ratio))
@@ -563,7 +563,7 @@ class QuarterRandomResizedCrop(RandomResizedCrop):
             PIL Image or Tensor: Randomly cropped and resized image.
         """
         i, j, h, w = QuarterRandomResizedCrop.get_params(img, self.scale, self.ratio, self.quarter)
-        return F.resized_crop(img, i, j, h, w, self.size, self.interpolation)
+        return torchvision_F.resized_crop(img, i, j, h, w, self.size, self.interpolation)
 
 
 class DataAugmentationDINO(object):
