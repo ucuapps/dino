@@ -16,6 +16,7 @@ import os
 import sys
 import datetime
 import time
+import yaml
 import math
 import random
 import json
@@ -156,6 +157,8 @@ def train_dino(args):
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
+    with (Path(args.output_dir) / "config.yaml").open("w") as fp:
+        yaml.dump(args, fp)
     writer = SummaryWriter(log_dir=args.output_dir)
 
     # ============ preparing data ... ============
