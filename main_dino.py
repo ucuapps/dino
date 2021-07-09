@@ -17,6 +17,7 @@ import sys
 import datetime
 import time
 import math
+import random
 import json
 from pathlib import Path
 
@@ -29,6 +30,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
+from torch.utils.tensorboard import SummaryWriter
 
 import utils
 import vision_transformer as vits
@@ -96,7 +98,7 @@ def get_args_parser():
         linear warmup (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.""")
     parser.add_argument("--warmup_epochs", default=10, type=int,
-        help="Number of epochs for the linear learning-rate warm up.")
+                        help="Number of epochs for the linear learning-rate warm up.")
     parser.add_argument('--min_lr', type=float, default=1e-6, help="""Target LR at the
         end of optimization. We use a cosine LR schedule with linear warmup.""")
     parser.add_argument('--optimizer', default='adamw', type=str,
@@ -133,6 +135,8 @@ def train_dino(args):
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
+
+    writer = SummaryWriter(log_dir=args.output_dir)
 
     # ============ preparing data ... ============
     transform = DataAugmentationDINO(
@@ -263,8 +267,8 @@ def train_dino(args):
 
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args)
+                                      data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
+                                      epoch, fp16_scaler, args, writer)
 
         # ============ writing logs ... ============
         save_dict = {
@@ -275,6 +279,9 @@ def train_dino(args):
             'args': args,
             'dino_loss': dino_loss.state_dict(),
         }
+        writer.add_scalar("Loss/train", train_stats['loss'], epoch)
+        writer.add_scalar("Learning Rate", train_stats['lr'], epoch)
+
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
@@ -288,11 +295,13 @@ def train_dino(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    writer.flush()
+    writer.close()
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
-                    optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
-                    fp16_scaler, args):
+                    optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
+                    fp16_scaler, args, logger):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
@@ -302,6 +311,16 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
+
+        if it % 10 == 0:
+            mean, std = 0.5, 0.25
+            rnd_image_id = random.randint(0, args.batch_size_per_gpu-1)
+            sample_images_global = np.array([np.array(i) for i in images[:2]]
+                                            )[:, rnd_image_id, :, :, :]
+            sample_images_local = np.array([np.array(i) for i in images[2:]]
+                                           )[:, rnd_image_id, :, :, :]
+            logger.add_images('Global views', sample_images_global*std+mean, it)
+            logger.add_images('Local views', sample_images_local*std+mean, it)
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
@@ -420,7 +439,8 @@ class DataAugmentationDINO(object):
         ])
         normalize = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            # transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            transforms.Normalize((0.5), (0.25)),
         ])
 
         # first global crop
