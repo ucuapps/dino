@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import argparse
+import sklearn.metrics as metrics
 
 import torch
 from torch import nn
@@ -126,12 +127,14 @@ def extract_features(model, data_loader):
 
 
 @torch.no_grad()
-def knn_classifier(train_features, train_labels, test_features, test_labels, k, T, num_classes=1000):
-    top1, top5, total = 0.0, 0.0, 0
+def knn_classifier(train_features, train_labels, test_features, test_labels, k, T, num_classes=2):
+    top1, top5, total, f1 = 0.0, 0.0, 0, []
     train_features = train_features.t()
     num_test_images, num_chunks = test_labels.shape[0], 100
     imgs_per_chunk = num_test_images // num_chunks
     retrieval_one_hot = torch.zeros(k, num_classes).cuda()
+    y_true, y_pred = [], []
+
     for idx in range(0, num_test_images, imgs_per_chunk):
         # get the features for test images
         features = test_features[
@@ -161,11 +164,15 @@ def knn_classifier(train_features, train_labels, test_features, test_labels, k, 
         # find the predictions that match the target
         correct = predictions.eq(targets.data.view(-1, 1))
         top1 = top1 + correct.narrow(1, 0, 1).sum().item()
-        top5 = top5 + correct.narrow(1, 0, 5).sum().item()
+
+        _, preds = torch.max(probs, 1)
+        trgts = torch.flatten(targets.data.view(-1, 1))
+        y_true.extend(trgts.tolist()), y_pred.extend(preds.tolist())
+
         total += targets.size(0)
     top1 = top1 * 100.0 / total
-    top5 = top5 * 100.0 / total
-    return top1, top5
+
+    return top1, metrics.f1_score(y_true, y_pred, average='binary'), metrics.confusion_matrix(y_true, y_pred)
 
 
 class ReturnIndexDataset(datasets.ImageFolder):
@@ -223,7 +230,8 @@ if __name__ == '__main__':
 
         print("Features are ready!\nStart the k-NN classification.")
         for k in args.nb_knn:
-            top1, top5 = knn_classifier(train_features, train_labels,
+            top1, f1_score, conf_matrix = knn_classifier(train_features, train_labels,
                 test_features, test_labels, k, args.temperature)
-            print(f"{k}-NN classifier result: Top1: {top1}, Top5: {top5}")
+            print(f"{k}-NN classifier result: Top1: {top1}, 'F1-score: {f1_score}, '\n' Confusion Matrix: "
+                  f"{conf_matrix}")
     dist.barrier()
