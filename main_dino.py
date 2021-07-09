@@ -36,6 +36,26 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
+import math
+import numbers
+import random
+import warnings
+from collections.abc import Sequence
+from typing import Tuple, List, Optional
+
+import torch
+from torch import Tensor
+
+try:
+    import accimage
+except ImportError:
+    accimage = None
+
+from torchvision.transforms import functional as torchvision_F
+from torchvision.transforms.functional import InterpolationMode, _interpolation_modes_from_int
+from torchvision.transforms import RandomResizedCrop
+
+
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
@@ -427,6 +447,125 @@ class DINOLoss(nn.Module):
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
+def _setup_size(size, error_msg):
+    if isinstance(size, numbers.Number):
+        return int(size), int(size)
+
+    if isinstance(size, Sequence) and len(size) == 1:
+        return size[0], size[0]
+
+    if len(size) != 2:
+        raise ValueError(error_msg)
+
+    return size
+
+
+class QuarterRandomResizedCrop(RandomResizedCrop):
+
+    def __init__(self, size, quarter=-1, scale=(0.08, 1.0), ratio=(3. / 4., 4. / 3.),
+                 interpolation=InterpolationMode.BILINEAR):
+        super().__init__(size, scale, ratio, interpolation)
+        self.size = _setup_size(size, error_msg="Please provide only two dimensions (h, w) for size.")
+
+        if not isinstance(scale, Sequence):
+            raise TypeError("Scale should be a sequence")
+        if not isinstance(ratio, Sequence):
+            raise TypeError("Ratio should be a sequence")
+        if (scale[0] > scale[1]) or (ratio[0] > ratio[1]):
+            warnings.warn("Scale and ratio should be of kind (min, max)")
+
+        # Backward compatibility with integer value
+        if isinstance(interpolation, int):
+            warnings.warn(
+                "Argument interpolation should be of type InterpolationMode instead of int. "
+                "Please, use InterpolationMode enum."
+            )
+            interpolation = _interpolation_modes_from_int(interpolation)
+
+        self.interpolation = interpolation
+        self.scale = scale
+        self.ratio = ratio
+        self.quarter = quarter
+
+    @staticmethod
+    def get_bounds_for_quarter(width, height, quarter):
+        if quarter == 1:
+            return 0,  width // 4, 0, height // 2
+        if quarter == 2:
+            return (3 * width) // 4, width, 0, height // 2
+        if quarter == 3:
+            return 0, width // 4, height // 2, height
+        if quarter == 0:
+            return (3 * width) // 4, width, height // 2, height
+        else:
+            return width, height
+
+    @staticmethod
+    def get_params(
+            img: Tensor, scale: List[float], ratio: List[float], quarter: int,
+    ) -> Tuple[int, int, int, int]:
+        """Get parameters for ``crop`` for a random sized crop.
+
+        Args:
+            img (PIL Image or Tensor): Input image.
+            scale (list): range of scale of the origin size cropped
+            ratio (list): range of aspect ratio of the origin aspect ratio cropped
+
+        Returns:
+            tuple: params (i, j, h, w) to be passed to ``crop`` for a random
+            sized crop.
+            :param quarter:
+        """
+        width, height = torchvision_F._get_image_size(img)
+        area = height * width
+
+        log_ratio = torch.log(torch.tensor(ratio))
+        for _ in range(10):
+            target_area = area * torch.empty(1).uniform_(scale[0], scale[1]).item()
+            aspect_ratio = torch.exp(
+                torch.empty(1).uniform_(log_ratio[0], log_ratio[1])
+            ).item()
+
+            w = int(round(math.sqrt(target_area * aspect_ratio)))
+            h = int(round(math.sqrt(target_area / aspect_ratio)))
+
+            width_start, width_finish, height_start, height_finish = \
+                QuarterRandomResizedCrop.get_bounds_for_quarter(w, h, quarter)
+
+            if 0 < w <= width and 0 < h <= height:
+                #                 i = torch.randint(0, height - h + 1, size=(1,)).item()
+                #                 j = torch.randint(0, width - w + 1, size=(1,)).item()
+                i = torch.randint(height_start, height_finish + 1, size=(1,)).item()
+                j = torch.randint(width_start, width_finish + 1, size=(1,)).item()
+                return i, j, h, w
+
+        # Fallback to central crop
+        in_ratio = float(width) / float(height)
+        if in_ratio < min(ratio):
+            w = width
+            h = int(round(w / min(ratio)))
+        elif in_ratio > max(ratio):
+            h = height
+            w = int(round(h * max(ratio)))
+        else:  # whole image
+            w = width
+            h = height
+        i = (height - h) // 2
+        j = (width - w) // 2
+        return i, j, h, w
+
+    def forward(self, img):
+        """
+        Args:
+            img (PIL Image or Tensor): Image to be cropped and resized.
+
+        Returns:
+            PIL Image or Tensor: Randomly cropped and resized image.
+        """
+        i, j, h, w = QuarterRandomResizedCrop.get_params(img, self.scale, self.ratio, self.quarter)
+        return torchvision_F.resized_crop(img, i, j, h, w, self.size, self.interpolation)
+
+
 class DataAugmentationDINO(object):
     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
         flip_and_color_jitter = transforms.Compose([
@@ -460,19 +599,19 @@ class DataAugmentationDINO(object):
         ])
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
-        self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
+        self.local_transfo = [transforms.Compose([
+            QuarterRandomResizedCrop(96, quarter=i % 4, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
-        ])
+        ]) for i in range(self.local_crops_number)]
 
     def __call__(self, image):
         crops = []
         crops.append(self.global_transfo1(image))
         crops.append(self.global_transfo2(image))
-        for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
+        for transform in self.local_transfo:
+            crops.append(transform(image))
         return crops
 
 
