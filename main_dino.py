@@ -18,13 +18,13 @@ import datetime
 import time
 import yaml
 import json
+from tqdm import tqdm
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
@@ -106,7 +106,7 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=64, type=int,
+    parser.add_argument('--batch_size', default=64, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -141,14 +141,12 @@ def get_args_parser():
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
-    parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
-        distributed training; see https://pytorch.org/docs/stable/distributed.html""")
-    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+    parser.add_argument("--gpus", default="0,1", type=str)
     return parser
 
 
 def train_dino(args):
-    utils.init_distributed_mode(args)
+    args.gpus = [int(x) for x in args.gpus.split(',')]
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
@@ -165,11 +163,11 @@ def train_dino(args):
         args.local_crops_number,
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    sampler = torch.utils.data.RandomSampler(dataset)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
@@ -214,12 +212,14 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DataParallel(teacher, device_ids=args.gpus)
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
-        teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+        teacher = nn.parallel.DataParallel(teacher, device_ids=args.gpus)
+        teacher_without_ddp = teacher.module
+
+    student = nn.parallel.DataParallel(student, device_ids=args.gpus)
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
@@ -235,7 +235,7 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
-    ).cuda()
+    ).cuda(device='cuda:{}'.format(args.gpus[0]))
 
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
@@ -252,7 +252,7 @@ def train_dino(args):
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
+        args.lr * (args.batch_size * utils.get_world_size()) / 256.,  # linear scaling rule
         args.min_lr,
         args.epochs, len(data_loader),
         warmup_epochs=args.warmup_epochs,
@@ -283,7 +283,6 @@ def train_dino(args):
     start_time = time.time()
     print("Starting DINO training !")
     for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
@@ -322,73 +321,75 @@ def train_dino(args):
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
                     fp16_scaler, args, logger):
-    metric_logger = utils.MetricLogger(delimiter="  ")
+
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
-        # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
-        for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
-                param_group["weight_decay"] = wd_schedule[it]
+    with tqdm(data_loader, unit="batch") as tepoch:
+        for it, (images, _) in enumerate(tepoch):
 
-        if it % 10 == 0:
-            mean, std = 0.5, 0.25
-            rnd_image_id = random.randint(0, args.batch_size_per_gpu-1)
-            sample_images_global = np.array([np.array(i) for i in images[:2]]
-                                            )[:, rnd_image_id, :, :, :]
-            sample_images_local = np.array([np.array(i) for i in images[2:]]
-                                           )[:, rnd_image_id, :, :, :]
-            logger.add_images('Global views', sample_images_global*std+mean, it)
-            logger.add_images('Local views', sample_images_local*std+mean, it)
+            # update weight decay and learning rate according to their schedule
+            it = len(data_loader) * epoch + it  # global training iteration
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group["lr"] = lr_schedule[it]
+                if i == 0:  # only the first group is regularized
+                    param_group["weight_decay"] = wd_schedule[it]
 
-        # move images to gpu
-        images = [im.cuda(non_blocking=True) for im in images]
-        # teacher and student forward passes + compute dino loss
-        with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            if it % 10 == 0:
+                mean, std = 0.5, 0.25
+                rnd_image_id = random.randint(0, args.batch_size-1)
+                sample_images_global = np.array([np.array(i) for i in images[:2]]
+                                                )[:, rnd_image_id, :, :, :]
+                sample_images_local = np.array([np.array(i) for i in images[2:]]
+                                               )[:, rnd_image_id, :, :, :]
+                logger.add_images('Global views', sample_images_global*std+mean, it)
+                logger.add_images('Local views', sample_images_local*std+mean, it)
 
-        if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
-            sys.exit(1)
+            # move images to gpu
+            images = [im.cuda(device='cuda:{}'.format(args.gpus[0])) for im in images]
+            # teacher and student forward passes + compute dino loss
+            with torch.cuda.amp.autocast(fp16_scaler is not None):
+                teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
+                student_output = student(images)
+                loss = dino_loss(student_output, teacher_output, epoch)
 
-        # student update
-        optimizer.zero_grad()
-        param_norms = None
-        if fp16_scaler is None:
-            loss.backward()
-            if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
-            optimizer.step()
-        else:
-            fp16_scaler.scale(loss).backward()
-            if args.clip_grad:
-                fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
+            if not math.isfinite(loss.item()):
+                print("Loss is {}, stopping training".format(loss.item()), force=True)
+                sys.exit(1)
 
-        # EMA update for the teacher
-        with torch.no_grad():
-            m = momentum_schedule[it]  # momentum parameter
-            for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+            # student update
+            optimizer.zero_grad()
+            param_norms = None
+            if fp16_scaler is None:
+                loss.backward()
+                if args.clip_grad:
+                    param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.cancel_gradients_last_layer(epoch, student,
+                                                  args.freeze_last_layer)
+                optimizer.step()
+            else:
+                fp16_scaler.scale(loss).backward()
+                if args.clip_grad:
+                    fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+                    param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.cancel_gradients_last_layer(epoch, student,
+                                                  args.freeze_last_layer)
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
 
-        # logging
-        torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+            # EMA update for the teacher
+            with torch.no_grad():
+                m = momentum_schedule[it]  # momentum parameter
+                for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
+                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+
+            # logging
+            tepoch.set_description(header)
+            tepoch.set_postfix(loss=loss.item())
+
+    return {
+        'loss': loss.item(),
+        'lr': optimizer.param_groups[0]["lr"],
+        'wd': optimizer.param_groups[0]["weight_decay"]
+    }
 
 
 class DINOLoss(nn.Module):
@@ -440,8 +441,7 @@ class DINOLoss(nn.Module):
         Update center used for teacher output.
         """
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
-        dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+        batch_center = batch_center / (len(teacher_output)) #* dist.get_world_size())
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
