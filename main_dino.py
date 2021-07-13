@@ -140,13 +140,14 @@ def get_args_parser():
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
-    parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
-    parser.add_argument("--gpus", default="0,1", type=str)
+    parser.add_argument('--num_workers', default=16, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument("--gpus", default=[0, 1], type=list, help='GPUs ids  to use for training')
     return parser
 
 
 def train_dino(args):
-    args.gpus = [int(x) for x in args.gpus.split(',')]
+    primary_gpu = 'cuda:{}'.format(args.gpus[0])
+    print('\nLaunching training on {} as a primary gpu'.format(args.gpus[0]))
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
@@ -205,23 +206,23 @@ def train_dino(args):
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
     # move networks to gpu
-    student, teacher = student.cuda(), teacher.cuda()
+    student, teacher = student.to(primary_gpu), teacher.to(primary_gpu)
     # synchronize batch norms (if any)
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
-        # we need DDP wrapper to have synchro batch norms working...
+    teacher_without_ddp = teacher
+    if len(args.gpus) > 1:
         teacher = nn.parallel.DataParallel(teacher, device_ids=args.gpus)
-        teacher_without_ddp = teacher.module
-    else:
-        # teacher_without_ddp and teacher are the same thing
-        teacher = nn.parallel.DataParallel(teacher, device_ids=args.gpus)
+        student = nn.parallel.DataParallel(student, device_ids=args.gpus)
         teacher_without_ddp = teacher.module
 
-    student = nn.parallel.DataParallel(student, device_ids=args.gpus)
-    # teacher and student start with the same weights
-    teacher_without_ddp.load_state_dict(student.module.state_dict())
+        # teacher and student start with the same weights
+        teacher_without_ddp.load_state_dict(student.module.state_dict())
+    else:
+        teacher_without_ddp.load_state_dict(student.state_dict())
+
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
@@ -235,7 +236,7 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
-    ).cuda(device='cuda:{}'.format(args.gpus[0]))
+    ).cuda(device=primary_gpu)
 
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
@@ -378,7 +379,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             # EMA update for the teacher
             with torch.no_grad():
                 m = momentum_schedule[it]  # momentum parameter
-                for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
+                stud_params = student.parameters() if len(args.gpus) == 1 else student.module.parameters()
+                for param_q, param_k in zip(stud_params, teacher_without_ddp.parameters()):
                     param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
             # logging
