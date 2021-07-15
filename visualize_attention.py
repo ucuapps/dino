@@ -183,7 +183,7 @@ if __name__ == '__main__':
         transform = pth_transforms.Compose([
             pth_transforms.Resize(args.image_size),
             pth_transforms.ToTensor(),
-            pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            pth_transforms.Normalize((0.5), (0.25)),
         ])
         img = transform(img)
 
@@ -229,4 +229,4 @@ if __name__ == '__main__':
         if args.threshold is not None:
             image = skimage.io.imread(image_name_to_save)
             for j in range(nh):
-                display_instances(image, th_attn[j], fname=os.path.join(args.output_dir, "mask_th" + str(args.threshold) + "_head" + str(j) +".png"), blur=False)
+                display_instances(image, th_attn[j], fname=os.path.join(args.output_dir, "mask_th" + str(args.threshold) + "_head" + str(j) + "-" + image_name.replace('.png', '') + ".png"), blur=False)
