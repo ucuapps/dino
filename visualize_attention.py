@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import pickle
 import sys
 import argparse
 import cv2
@@ -219,6 +220,13 @@ if __name__ == '__main__':
 
         # save attentions heatmaps
         os.makedirs(args.output_dir, exist_ok=True)
+
+        if args.threshold is not None:
+            with open(os.path.join(args.output_dir, f"th_attn-{image_name.replace('.png', '')}.pcl"), 'wb') as f:
+                pickle.dump(th_attn, f)
+        with open(os.path.join(args.output_dir, f"attentions-{image_name.replace('.png', '')}.pcl"), 'wb') as f:
+            pickle.dump(attentions, f)
+
         image_name_to_save = os.path.join(args.output_dir, image_name)
         torchvision.utils.save_image(torchvision.utils.make_grid(img, normalize=True, scale_each=True), image_name_to_save)
         for j in range(nh):
