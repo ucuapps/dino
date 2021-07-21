@@ -96,7 +96,7 @@ def get_args_parser():
                         help='Number of warmup epochs for the teacher temperature (Default: 30).')
 
     # Training/Optimization parameters
-    parser.add_argument('--use_fp16', type=utils.bool_flag, default=False, help="""Whether or not
+    parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
         to use half precision for training. Improves training time and memory requirements,
         but can provoke instability and slight decay of performance. We recommend disabling
         mixed precision if the loss is unstable, if reducing the patch size or if training with bigger ViTs.""")
@@ -154,7 +154,7 @@ def train_dino(args):
     print('\nLaunching training on {} as a primary gpu'.format(args.gpus[0]))
     utils.fix_random_seeds(args.seed)
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
-    cudnn.benchmark = False
+    cudnn.benchmark = True
 
     with (Path(args.output_dir) / "config.yaml").open("w") as fp:
         yaml.dump(args, fp)
@@ -347,7 +347,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 if i == 0:  # only the first group is regularized
                     param_group["weight_decay"] = wd_schedule[it]
 
-            if it % 10 == 0:
+            if it % 100 == 0:
                 mean, std = 0.5, 0.25
                 rnd_image_id = random.randint(0, args.batch_size - 1)
                 sample_images_global = np.array([np.array(i) for i in images[:2]]
@@ -363,7 +363,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
             with torch.cuda.amp.autocast(fp16_scaler is not None):
                 teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
                 student_output = student(images)
-                loss = dino_loss(student_output, teacher_output, epoch) / args.accum_iter
+                loss = dino_loss(student_output, teacher_output, epoch) # / args.accum_iter
                 del teacher_output
                 del student_output
 
@@ -374,25 +374,35 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 sys.exit(1)
 
             # student update
-            loss.backward()
-
-            if (i + 1) % args.accum_iter == 0 or (i + 1 == len(data_loader)):
+            optimizer.zero_grad()
+            param_norms = None
+            if fp16_scaler is None:
+                loss.backward()
+                if args.clip_grad:
+                    param_norms = utils.clip_gradients(student, args.clip_grad)
                 utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
+                                                  args.freeze_last_layer)
                 optimizer.step()
-                # Reset gradients, for the next accumulated batches
-                optimizer.zero_grad()
+            else:
+                fp16_scaler.scale(loss).backward()
+                if args.clip_grad:
+                    fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+                    param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.cancel_gradients_last_layer(epoch, student,
+                                                  args.freeze_last_layer)
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
 
-                # EMA update for the teacher
-                with torch.no_grad():
-                    m = momentum_schedule[it]  # momentum parameter
-                    stud_params = student.parameters() if len(args.gpus) == 1 else student.module.parameters()
-                    for param_q, param_k in zip(stud_params, teacher.parameters()):
-                        param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+            # EMA update for the teacher
+            with torch.no_grad():
+                m = momentum_schedule[it]  # momentum parameter
+                stud_params = student.parameters() if len(args.gpus) == 1 else student.module.parameters()
+                for param_q, param_k in zip(stud_params, teacher.parameters()):
+                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
             # logging
             tepoch.set_description(header)
-            tepoch.set_postfix(loss=loss.item()/args.accum_iter)
+            tepoch.set_postfix(loss=loss.item())
 
     torch.cuda.empty_cache()
 
@@ -592,20 +602,20 @@ class DataAugmentationDINO(object):
         ])
         normalize = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-            # transforms.Normalize((0.5), (0.25)),
+            # transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            transforms.Normalize((0.5), (0.25)),
         ])
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(512, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(512, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
@@ -614,7 +624,7 @@ class DataAugmentationDINO(object):
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = [transforms.Compose([
-            QuarterRandomResizedCrop(128, quarter=i % 4, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            QuarterRandomResizedCrop(96, quarter=i % 4, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
