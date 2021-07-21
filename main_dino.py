@@ -373,18 +373,20 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 print("Loss is {}, stopping training".format(loss.item()), force=True)
                 sys.exit(1)
 
-            # student update
-            optimizer.zero_grad()
+            # # student update
+            # optimizer.zero_grad()
             param_norms = None
-            if fp16_scaler is None:
-                loss.backward()
-                if args.clip_grad:
-                    param_norms = utils.clip_gradients(student, args.clip_grad)
-                utils.cancel_gradients_last_layer(epoch, student,
-                                                  args.freeze_last_layer)
-                optimizer.step()
-            else:
-                fp16_scaler.scale(loss).backward()
+
+            fp16_scaler.scale(loss).backward()
+
+            # EMA update for the teacher
+            with torch.no_grad():
+                m = momentum_schedule[it]  # momentum parameter
+                stud_params = student.parameters() if len(args.gpus) == 1 else student.module.parameters()
+                for param_q, param_k in zip(stud_params, teacher.parameters()):
+                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+
+            if (i + 1) % args.accum_iter == 0:
                 if args.clip_grad:
                     fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                     param_norms = utils.clip_gradients(student, args.clip_grad)
@@ -393,12 +395,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 fp16_scaler.step(optimizer)
                 fp16_scaler.update()
 
-            # EMA update for the teacher
-            with torch.no_grad():
-                m = momentum_schedule[it]  # momentum parameter
-                stud_params = student.parameters() if len(args.gpus) == 1 else student.module.parameters()
-                for param_q, param_k in zip(stud_params, teacher.parameters()):
-                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+                optimizer.zero_grad()
 
             # logging
             tepoch.set_description(header)
