@@ -251,7 +251,7 @@ def train_dino(args):
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
-        args.lr * args.batch_size / 256.,  # linear scaling rule
+        args.lr, #* args.batch_size / 256.,  # linear scaling rule
         args.min_lr,
         args.epochs, len(data_loader),
         warmup_epochs=args.warmup_epochs,
@@ -317,6 +317,8 @@ def train_dino(args):
             'dino_loss': dino_loss.state_dict(),
         }
         writer.add_scalar("Loss/train", train_stats['loss'], epoch)
+        writer.add_scalar("BCELoss/train", train_stats['bce_loss'], epoch)
+        writer.add_scalar("DinoLoss/train", train_stats['dino_loss'], epoch)
         writer.add_scalar("Learning Rate", train_stats['lr'], epoch)
 
         if fp16_scaler is not None:
@@ -339,6 +341,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
                     fp16_scaler, args, logger):
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
+    t_loss, bce_loss_list, d_loss_list = [], [], []
     with tqdm(data_loader, unit="batch") as tepoch:
         for it, (images, labels) in enumerate(tepoch):
 
@@ -367,15 +370,16 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 student_output, stud_class_out = student(images, is_student=True)
 
                 labels = [l.cuda(device='cuda:{}'.format(args.gpus[0])) for l in labels]
-                loss = dino_loss(student_output, stud_class_out, teacher_output, epoch, torch.stack(labels, dim=0))
-
+                loss, bce_loss, d_loss = dino_loss(student_output, stud_class_out, teacher_output, epoch, torch.stack(labels, dim=0))
+                d_loss_list.append(d_loss.item())
+                bce_loss_list.append(bce_loss.item())
+                t_loss.append(loss.item())
 
             if not math.isfinite(loss.item()):
                 print("Loss is {}, stopping training".format(loss.item()), force=True)
                 sys.exit(1)
 
             param_norms = None
-            optimizer.zero_grad()
 
             fp16_scaler.scale(loss).backward()
             if args.clip_grad:
@@ -385,6 +389,8 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
+
+            optimizer.zero_grad()
 
             # EMA update for the teacher
             with torch.no_grad():
@@ -404,10 +410,12 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
             tepoch.set_description(header)
             tepoch.set_postfix(loss=loss.item())
 
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
 
     return {
-        'loss': loss.item(),
+        'loss': np.mean(t_loss),
+        'bce_loss': np.mean(bce_loss_list),
+        'dino_loss': np.mean(d_loss_list),
         'lr': optimizer.param_groups[0]["lr"],
         'wd': optimizer.param_groups[0]["weight_decay"]
     }

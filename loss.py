@@ -111,7 +111,7 @@ class DINOLossClassification_BCE(nn.Module):
 
         total_loss = dino_loss * (1 - self.bce_weight) + bce_loss * self.bce_weight
 
-        return total_loss
+        return total_loss, bce_loss, dino_loss
 
     @torch.no_grad()
     def update_center(self, teacher_output):
