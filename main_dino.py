@@ -110,7 +110,6 @@ def get_args_parser():
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
-    parser.add_argument('--accum_iter', default=8, type=int)
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
@@ -145,13 +144,13 @@ def get_args_parser():
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=16, type=int, help='Number of data loading workers per GPU.')
-    parser.add_argument("--gpus", default=(0, 1), type=int, nargs='+', help='GPUs ids  to use for training')
+    parser.add_argument("--gpus", default=('0', '1'), type=int, nargs='+', help='GPUs ids  to use for training')
+    parser.add_argument("--local_rank", default=0, type=int)
+
     return parser
 
 
 def train_dino(args):
-    primary_gpu = 'cuda:{}'.format(args.gpus[0])
-    print('\nLaunching training on {} as a primary gpu'.format(args.gpus[0]))
     utils.fix_random_seeds(args.seed)
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
@@ -167,13 +166,13 @@ def train_dino(args):
         args.local_crops_number,
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    sampler = torch.utils.data.RandomSampler(dataset)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=False,
+        pin_memory=True,
         drop_last=True,
     )
     print(f"Data loaded: there are {len(dataset)} images.")
@@ -209,15 +208,15 @@ def train_dino(args):
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
     # move networks to gpu
-    student, teacher = student.to(primary_gpu), teacher.to(primary_gpu)
+    student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
     if len(args.gpus) > 1:
-        teacher = nn.parallel.DataParallel(teacher, device_ids=args.gpus)
-        student = nn.parallel.DataParallel(student, device_ids=args.gpus)
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpus])
+        student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpus])
 
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
@@ -232,7 +231,7 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
-    ).cuda(device=primary_gpu)
+    ).cuda()
 
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
@@ -249,7 +248,7 @@ def train_dino(args):
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
-        args.lr * args.batch_size / 256.,  # linear scaling rule
+        args.lr,  # linear scaling rule
         args.min_lr,
         args.epochs, len(data_loader),
         warmup_epochs=args.warmup_epochs,
@@ -314,7 +313,7 @@ def train_dino(args):
             'args': args,
             'dino_loss': dino_loss.state_dict(),
         }
-        writer.add_scalar("Loss/train", train_stats['loss'], epoch)
+        writer.add_scalar("Loss/train", train_stats['loss_total'], epoch)
         writer.add_scalar("Learning Rate", train_stats['lr'], epoch)
 
         if fp16_scaler is not None:
@@ -337,6 +336,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
                     fp16_scaler, args, logger):
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
+    loss_history = []
     with tqdm(data_loader, unit="batch") as tepoch:
         for it, (images, _) in enumerate(tepoch):
 
@@ -347,7 +347,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 if i == 0:  # only the first group is regularized
                     param_group["weight_decay"] = wd_schedule[it]
 
-            if it % 100 == 0:
+            if it % 200 == 0:
                 mean, std = 0.5, 0.25
                 rnd_image_id = random.randint(0, args.batch_size - 1)
                 sample_images_global = np.array([np.array(i) for i in images[:2]]
@@ -358,35 +358,31 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 logger.add_images('Local views', sample_images_local * std + mean, it)
 
             # move images to gpu
-            images = [im.cuda(device='cuda:{}'.format(args.gpus[0])) for im in images]
+            images = [im.cuda(non_blocking=True) for im in images]
             # teacher and student forward passes + compute dino loss
             with torch.cuda.amp.autocast(fp16_scaler is not None):
                 teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
                 student_output = student(images)
-                loss = dino_loss(student_output, teacher_output, epoch) # / args.accum_iter
-                del teacher_output
-                del student_output
-
-            del images
+                loss = dino_loss(student_output, teacher_output, epoch)
+                loss_history.append(loss.item())
 
             if not math.isfinite(loss.item()):
                 print("Loss is {}, stopping training".format(loss.item()), force=True)
                 sys.exit(1)
 
-            # # student update
-            # optimizer.zero_grad()
+            # student update
+            optimizer.zero_grad()
             param_norms = None
 
-            fp16_scaler.scale(loss).backward()
-
-            # EMA update for the teacher
-            with torch.no_grad():
-                m = momentum_schedule[it]  # momentum parameter
-                stud_params = student.parameters() if len(args.gpus) == 1 else student.module.parameters()
-                for param_q, param_k in zip(stud_params, teacher.parameters()):
-                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-
-            if (i + 1) % args.accum_iter == 0:
+            if fp16_scaler is None:
+                loss.backward()
+                if args.clip_grad:
+                    param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.cancel_gradients_last_layer(epoch, student,
+                                                  args.freeze_last_layer)
+                optimizer.step()
+            else:
+                fp16_scaler.scale(loss).backward()
                 if args.clip_grad:
                     fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                     param_norms = utils.clip_gradients(student, args.clip_grad)
@@ -395,16 +391,20 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 fp16_scaler.step(optimizer)
                 fp16_scaler.update()
 
-                optimizer.zero_grad()
+                # EMA update for the teacher
+            with torch.no_grad():
+                m = momentum_schedule[it]  # momentum parameter
+                stud_params = student.parameters()  if len(args.gpus) == 1 else student.module.parameters()
+                for param_q, param_k in zip(stud_params, teacher.parameters()):
+                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
             # logging
             tepoch.set_description(header)
             tepoch.set_postfix(loss=loss.item())
 
-    torch.cuda.empty_cache()
-
     return {
         'loss': loss.item(),
+        'loss_total': np.mean(loss_history),
         'lr': optimizer.param_groups[0]["lr"],
         'wd': optimizer.param_groups[0]["weight_decay"]
     }
@@ -621,7 +621,7 @@ class DataAugmentationDINO(object):
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = [transforms.Compose([
-            QuarterRandomResizedCrop(96, quarter=i % 4, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
@@ -639,5 +639,8 @@ class DataAugmentationDINO(object):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
     args = parser.parse_args()
+    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join([str(x) for x in args.gpus])
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    torch.distributed.init_process_group(backend='nccl')
+    torch.cuda.set_device(args.local_rank)
     train_dino(args)
