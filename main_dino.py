@@ -278,6 +278,9 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     if args.pretrained_weights:
+
+        primary_gpu = 'cuda:{}'.format(args.gpus[0])
+
         state_dict = torch.load(args.pretrained_weights, map_location=primary_gpu)
         state_dict_student, state_dict_teacher = state_dict['student'], state_dict['teacher']
 
