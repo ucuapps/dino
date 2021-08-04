@@ -110,6 +110,7 @@ def get_args_parser():
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
+    parser.add_argument('--accum_iter', default=8, type=int)
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
@@ -422,7 +423,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
             tepoch.set_postfix(loss=loss.item())
 
     return {
-        'loss': np.mean(t_loss),
+        'loss': np.mean(loss.item()),
         'bce_loss': np.mean(bce_loss_list),
         'dino_loss': np.mean(d_loss_list),
         'loss_total': np.mean(t_loss),
