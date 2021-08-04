@@ -1,11 +1,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-#
+# 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+# 
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+# 
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -278,7 +278,10 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     if args.pretrained_weights:
-        state_dict = torch.load(args.pretrained_weights, map_location='cuda:{}'.format(args.gpus[0]))
+
+        primary_gpu = 'cuda:{}'.format(args.gpus[0])
+
+        state_dict = torch.load(args.pretrained_weights, map_location=primary_gpu)
         state_dict_student, state_dict_teacher = state_dict['student'], state_dict['teacher']
 
         # remove `module.` prefix
@@ -534,10 +537,12 @@ class QuarterRandomResizedCrop(RandomResizedCrop):
             img: Tensor, scale: List[float], ratio: List[float], quarter: int,
     ) -> Tuple[int, int, int, int]:
         """Get parameters for ``crop`` for a random sized crop.
+
         Args:
             img (PIL Image or Tensor): Input image.
             scale (list): range of scale of the origin size cropped
             ratio (list): range of aspect ratio of the origin aspect ratio cropped
+
         Returns:
             tuple: params (i, j, h, w) to be passed to ``crop`` for a random
             sized crop.
@@ -585,6 +590,7 @@ class QuarterRandomResizedCrop(RandomResizedCrop):
         """
         Args:
             img (PIL Image or Tensor): Image to be cropped and resized.
+
         Returns:
             PIL Image or Tensor: Randomly cropped and resized image.
         """
