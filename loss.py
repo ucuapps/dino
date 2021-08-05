@@ -65,7 +65,7 @@ class DINOLoss(nn.Module):
 class DINOLossClassification_BCE(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
                  warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
-                 center_momentum=0.9, bce_weight=0.7):
+                 center_momentum=0.9, bce_weight=0.1):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum

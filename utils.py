@@ -561,6 +561,29 @@ class LARS(torch.optim.Optimizer):
                 p.add_(mu, alpha=-g['lr'])
 
 
+class ClassificationHead(nn.Module):
+
+    def __init__(self, ncrops, num_classes):
+
+        super(ClassificationHead, self).__init__()
+
+        # self.ncrops = ncrops
+        # self.num_classes = num_classes
+
+        self.conv1d = nn.Conv1d(in_channels=ncrops, out_channels=ncrops, kernel_size=8, )
+        self.flatten = nn.Flatten(start_dim=1)
+        self.linear = nn.Linear((376 + 1) * ncrops, num_classes, bias=False)
+
+    def forward(self, x):
+        conv1d = self.conv1d(x)
+        # print('ClassificationHead conv1d', conv1d.shape)
+        flatten = self.flatten(conv1d)
+        # print('ClassificationHead flatten', flatten.shape)
+        linear = self.linear(flatten)
+        # print('ClassificationHead linear', linear.shape)
+        return linear
+
+
 class MultiCropWrapper(nn.Module):
     """
     Perform forward pass separately on each resolution input.
@@ -579,7 +602,7 @@ class MultiCropWrapper(nn.Module):
 
         self.ncrops = ncrops
         if is_student:
-            self.classficcation_head = nn.Linear(384 * ncrops, num_classes)
+            self.classficcation_head = ClassificationHead(ncrops, num_classes)
 
     def forward(self, x, is_student=False):
         # convert to list
@@ -601,9 +624,10 @@ class MultiCropWrapper(nn.Module):
         # Add classification branch
         if is_student:
             uncatted_out = output.chunk(self.ncrops)  # TODO: check if batch is correctly distributed
-            stacked_out = torch.stack(uncatted_out, dim=1).flatten(start_dim=1)
+            stacked_out = torch.stack(uncatted_out, dim=1)  # .flatten(start_dim=1)
             # print(len(uncatted_out), uncatted_out[0].shape, stacked_out.shape, output.shape)
-            x = self.classficcation_head(stacked_out)
+            stacked_out_2 = stacked_out.reshape((-1, self.ncrops, 384))
+            x = self.classficcation_head(stacked_out_2)
 
             return self.head(output), x
 
