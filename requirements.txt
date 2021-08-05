@@ -7,4 +7,3 @@ jupyterlab
 Pillow==8.2.0
 tensorboard==2.5.0
 PyYAML==5.4.1
-tqdm==4.61.2

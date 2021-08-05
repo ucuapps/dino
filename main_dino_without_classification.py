@@ -1,11 +1,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -26,6 +26,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 from torch.utils.tensorboard import SummaryWriter
@@ -33,7 +34,6 @@ from torch.utils.tensorboard import SummaryWriter
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
-import loss as losses
 
 import math
 import numbers
@@ -147,7 +147,7 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=16, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--gpus", default=('0', '1'), type=int, nargs='+', help='GPUs ids  to use for training')
     parser.add_argument("--local_rank", default=0, type=int)
-    parser.add_argument("--criterion", default='DINOLossClassification_BCE', type=str)
+
     return parser
 
 
@@ -173,7 +173,7 @@ def train_dino(args):
         sampler=sampler,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=False,
+        pin_memory=True,
         drop_last=True,
     )
     print(f"Data loaded: there are {len(dataset)} images.")
@@ -203,11 +203,10 @@ def train_dino(args):
         args.out_dim,
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
-    ),
-        ncrops=args.local_crops_number + 2, is_student=True)
+    ))
     teacher = utils.MultiCropWrapper(
         teacher,
-        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head), is_student=False
+        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -226,9 +225,7 @@ def train_dino(args):
     print(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
-    criterion = getattr(losses, args.criterion)
-
-    dino_loss = criterion(
+    dino_loss = DINOLoss(
         args.out_dim,
         args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
         args.warmup_teacher_temp,
@@ -281,10 +278,7 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     if args.pretrained_weights:
-
-        primary_gpu = 'cuda:{}'.format(args.gpus[0])
-
-        state_dict = torch.load(args.pretrained_weights, map_location=primary_gpu)
+        state_dict = torch.load(args.pretrained_weights, map_location='cuda:{}'.format(args.gpus[0]))
         state_dict_student, state_dict_teacher = state_dict['student'], state_dict['teacher']
 
         # remove `module.` prefix
@@ -320,9 +314,7 @@ def train_dino(args):
             'args': args,
             'dino_loss': dino_loss.state_dict(),
         }
-        writer.add_scalar("Loss/train", train_stats['loss'], epoch)
-        writer.add_scalar("BCELoss/train", train_stats['bce_loss'], epoch)
-        writer.add_scalar("DinoLoss/train", train_stats['dino_loss'], epoch)
+        writer.add_scalar("Loss/train", train_stats['loss_total'], epoch)
         writer.add_scalar("Learning Rate", train_stats['lr'], epoch)
 
         if fp16_scaler is not None:
@@ -345,9 +337,9 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
                     fp16_scaler, args, logger):
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    t_loss, bce_loss_list, d_loss_list = [], [], []
+    loss_history = []
     with tqdm(data_loader, unit="batch") as tepoch:
-        for it, (images, labels) in enumerate(tepoch):
+        for it, (images, _) in enumerate(tepoch):
 
             # update weight decay and learning rate according to their schedule
             it = len(data_loader) * epoch + it  # global training iteration
@@ -356,7 +348,7 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 if i == 0:  # only the first group is regularized
                     param_group["weight_decay"] = wd_schedule[it]
 
-            if it % 100 == 0:
+            if it % 200 == 0:
                 mean, std = 0.5, 0.25
                 rnd_image_id = random.randint(0, args.batch_size - 1)
                 sample_images_global = np.array([np.array(i) for i in images[:2]]
@@ -367,17 +359,13 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
                 logger.add_images('Local views', sample_images_local * std + mean, it)
 
             # move images to gpu
-            images = [im.cuda() for im in images]
+            images = [im.cuda(non_blocking=True) for im in images]
             # teacher and student forward passes + compute dino loss
             with torch.cuda.amp.autocast(fp16_scaler is not None):
-                teacher_output = teacher(images[:2], is_student=False)  # only the 2 global views pass through the teacher
-                student_output, stud_class_out = student(images, is_student=True)
-
-                labels = [l.cuda() for l in labels]
-                loss, bce_loss, d_loss = dino_loss(student_output, stud_class_out, teacher_output, epoch, torch.stack(labels, dim=0))
-                d_loss_list.append(d_loss.item())
-                bce_loss_list.append(bce_loss.item())
-                t_loss.append(loss.item())
+                teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
+                student_output = student(images)
+                loss = dino_loss(student_output, teacher_output, epoch)
+                loss_history.append(loss.item())
 
             if not math.isfinite(loss.item()):
                 print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -423,13 +411,69 @@ def train_one_epoch(student, teacher, dino_loss, data_loader,
             tepoch.set_postfix(loss=loss.item())
 
     return {
-        'loss': np.mean(loss.item()),
-        'bce_loss': np.mean(bce_loss_list),
-        'dino_loss': np.mean(d_loss_list),
-        'loss_total': np.mean(t_loss),
+        'loss': loss.item(),
+        'loss_total': np.mean(loss_history),
         'lr': optimizer.param_groups[0]["lr"],
         'wd': optimizer.param_groups[0]["weight_decay"]
     }
+
+
+class DINOLoss(nn.Module):
+    def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
+                 warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
+                 center_momentum=0.9):
+        super().__init__()
+        self.student_temp = student_temp
+        self.center_momentum = center_momentum
+        self.ncrops = ncrops
+        self.register_buffer("center", torch.zeros(1, out_dim))
+        # we apply a warm up for the teacher temperature because
+        # a too high temperature makes the training instable at the beginning
+        self.teacher_temp_schedule = np.concatenate((
+            np.linspace(warmup_teacher_temp,
+                        teacher_temp, warmup_teacher_temp_epochs),
+            np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
+        ))
+
+    def forward(self, student_output, teacher_output, epoch):
+        """
+        Cross-entropy between softmax outputs of the teacher and student networks.
+        """
+        student_out = student_output / self.student_temp
+        student_out = student_out.chunk(self.ncrops)
+
+        # teacher centering and sharpening
+        temp = self.teacher_temp_schedule[epoch]
+        teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
+        teacher_out = teacher_out.detach().chunk(2)
+
+        total_loss = 0
+        n_loss_terms = 0
+        for iq, q in enumerate(teacher_out):
+            for v in range(len(student_out)):
+                if v == iq:
+                    # we skip cases where student and teacher operate on the same view
+                    continue
+                loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
+                total_loss += loss.mean()
+                n_loss_terms += 1
+        del teacher_out
+        del student_out
+        del loss
+        total_loss /= n_loss_terms
+        self.update_center(teacher_output)
+        return total_loss
+
+    @torch.no_grad()
+    def update_center(self, teacher_output):
+        """
+        Update center used for teacher output.
+        """
+        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+        batch_center = batch_center / (len(teacher_output))
+
+        # ema update
+        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
 def _setup_size(size, error_msg):
@@ -490,12 +534,10 @@ class QuarterRandomResizedCrop(RandomResizedCrop):
             img: Tensor, scale: List[float], ratio: List[float], quarter: int,
     ) -> Tuple[int, int, int, int]:
         """Get parameters for ``crop`` for a random sized crop.
-
         Args:
             img (PIL Image or Tensor): Input image.
             scale (list): range of scale of the origin size cropped
             ratio (list): range of aspect ratio of the origin aspect ratio cropped
-
         Returns:
             tuple: params (i, j, h, w) to be passed to ``crop`` for a random
             sized crop.
@@ -543,7 +585,6 @@ class QuarterRandomResizedCrop(RandomResizedCrop):
         """
         Args:
             img (PIL Image or Tensor): Image to be cropped and resized.
-
         Returns:
             PIL Image or Tensor: Randomly cropped and resized image.
         """
@@ -585,7 +626,7 @@ class DataAugmentationDINO(object):
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = [transforms.Compose([
-            QuarterRandomResizedCrop(96, quarter=i % 4, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
