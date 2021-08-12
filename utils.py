@@ -567,15 +567,16 @@ class ClassificationHead(nn.Module):
 
         super(ClassificationHead, self).__init__()
 
-        # self.ncrops = ncrops
-        # self.num_classes = num_classes
-
-        self.conv1d = nn.Conv1d(in_channels=ncrops, out_channels=ncrops, kernel_size=8, )
+        self.avg_pool2d = nn.AvgPool2d(kernel_size=(ncrops, 1), )
+        self.conv1d = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=8, )
         self.flatten = nn.Flatten(start_dim=1)
-        self.linear = nn.Linear((376 + 1) * ncrops, num_classes, bias=False)
+        self.linear = nn.Linear(2041, num_classes, bias=False)  # 377
 
     def forward(self, x):
-        conv1d = self.conv1d(x)
+        # print('ClassificationHead x', x.shape)
+        avg_pool2d = self.avg_pool2d(x)
+        # print('ClassificationHead avg_pool2d', avg_pool2d.shape)
+        conv1d = self.conv1d(avg_pool2d)
         # print('ClassificationHead conv1d', conv1d.shape)
         flatten = self.flatten(conv1d)
         # print('ClassificationHead flatten', flatten.shape)
@@ -626,7 +627,7 @@ class MultiCropWrapper(nn.Module):
             uncatted_out = output.chunk(self.ncrops)  # TODO: check if batch is correctly distributed
             stacked_out = torch.stack(uncatted_out, dim=1)  # .flatten(start_dim=1)
             # print(len(uncatted_out), uncatted_out[0].shape, stacked_out.shape, output.shape)
-            stacked_out_2 = stacked_out.reshape((-1, self.ncrops, 384))
+            stacked_out_2 = stacked_out.reshape((-1, self.ncrops, 2048))  # 384
             x = self.classficcation_head(stacked_out_2)
 
             return self.head(output), x
