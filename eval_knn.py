@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import argparse
+import sklearn.metrics as metrics
 
 import torch
 from torch import nn
@@ -20,9 +21,14 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
+from torchvision import models as torchvision_models
 
 import utils
 import vision_transformer as vits
+
+torchvision_archs = sorted(name for name in torchvision_models.__dict__
+                           if name.islower() and not name.startswith("__")
+                           and callable(torchvision_models.__dict__[name]))
 
 
 def extract_feature_pipeline(args):
@@ -54,7 +60,14 @@ def extract_feature_pipeline(args):
     print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
 
     # ============ building network ... ============
-    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+
+    if args.arch in vits.__dict__.keys():
+        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+    elif args.arch in torchvision_models.__dict__.keys():
+        model = torchvision_models.__dict__[args.arch]()
+    else:
+        print(f"Unknow architecture: {args.arch}")
+
     print(f"Model {args.arch} {args.patch_size}x{args.patch_size} built.")
     model.cuda()
     utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
@@ -126,12 +139,14 @@ def extract_features(model, data_loader):
 
 
 @torch.no_grad()
-def knn_classifier(train_features, train_labels, test_features, test_labels, k, T, num_classes=1000):
-    top1, top5, total = 0.0, 0.0, 0
+def knn_classifier(train_features, train_labels, test_features, test_labels, k, T, num_classes=2):
+    top1, top5, total, f1 = 0.0, 0.0, 0, []
     train_features = train_features.t()
     num_test_images, num_chunks = test_labels.shape[0], 100
     imgs_per_chunk = num_test_images // num_chunks
     retrieval_one_hot = torch.zeros(k, num_classes).cuda()
+    y_true, y_pred = [], []
+
     for idx in range(0, num_test_images, imgs_per_chunk):
         # get the features for test images
         features = test_features[
@@ -161,11 +176,15 @@ def knn_classifier(train_features, train_labels, test_features, test_labels, k, 
         # find the predictions that match the target
         correct = predictions.eq(targets.data.view(-1, 1))
         top1 = top1 + correct.narrow(1, 0, 1).sum().item()
-        top5 = top5 + correct.narrow(1, 0, 5).sum().item()
+
+        _, preds = torch.max(probs, 1)
+        trgts = torch.flatten(targets.data.view(-1, 1))
+        y_true.extend(trgts.tolist()), y_pred.extend(preds.tolist())
+
         total += targets.size(0)
     top1 = top1 * 100.0 / total
-    top5 = top5 * 100.0 / total
-    return top1, top5
+
+    return top1, metrics.f1_score(y_true, y_pred, average='binary'), metrics.confusion_matrix(y_true, y_pred)
 
 
 class ReturnIndexDataset(datasets.ImageFolder):
@@ -185,7 +204,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_cuda', default=True, type=utils.bool_flag,
         help="Should we store the features on GPU? We recommend setting this to False if you encounter OOM")
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base'], help='Architecture (support only ViT atm).')
+        choices=['vit_tiny', 'vit_small', 'vit_base'] + torchvision_archs, help='Architecture (support only ViT atm).')
     parser.add_argument('--patch_size', default=16, type=int, help='Patch resolution of the model.')
     parser.add_argument("--checkpoint_key", default="teacher", type=str,
         help='Key to use in the checkpoint (example: "teacher")')
@@ -223,7 +242,8 @@ if __name__ == '__main__':
 
         print("Features are ready!\nStart the k-NN classification.")
         for k in args.nb_knn:
-            top1, top5 = knn_classifier(train_features, train_labels,
+            top1, f1_score, conf_matrix = knn_classifier(train_features, train_labels,
                 test_features, test_labels, k, args.temperature)
-            print(f"{k}-NN classifier result: Top1: {top1}, Top5: {top5}")
+            print(f"{k}-NN classifier result: Top1: {top1}, 'F1-score: {f1_score}, '\n' Confusion Matrix: "
+                  f"{conf_matrix}")
     dist.barrier()
