@@ -568,17 +568,14 @@ class ClassificationHead(nn.Module):
         super(ClassificationHead, self).__init__()
 
         self.avg_pool2d = nn.AvgPool2d(kernel_size=(ncrops, 1), )
-        self.conv1d = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=8, )
         self.flatten = nn.Flatten(start_dim=1)
-        self.linear = nn.Linear(2041, num_classes, bias=False)  # 377
+        self.linear = nn.Linear(2048, num_classes, bias=False)
 
     def forward(self, x):
         # print('ClassificationHead x', x.shape)
         avg_pool2d = self.avg_pool2d(x)
         # print('ClassificationHead avg_pool2d', avg_pool2d.shape)
-        conv1d = self.conv1d(avg_pool2d)
-        # print('ClassificationHead conv1d', conv1d.shape)
-        flatten = self.flatten(conv1d)
+        flatten = self.flatten(avg_pool2d)
         # print('ClassificationHead flatten', flatten.shape)
         linear = self.linear(flatten)
         # print('ClassificationHead linear', linear.shape)
