@@ -23,7 +23,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
-from torchvision import datasets
+from torchvision import datasets, transforms
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
 
@@ -41,7 +41,9 @@ def make_predictions_pipeline(args):
         pth_transforms.Resize(256, interpolation=3),
         pth_transforms.CenterCrop(224),
         pth_transforms.ToTensor(),
-        pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        # pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        pth_transforms.Normalize((0.5), (0.25)),
+
     ])
     dataset_val = ReturnIndexDataset(os.path.join(args.data_path, "val"), transform=transform)
     data_loader_val = torch.utils.data.DataLoader(
@@ -77,26 +79,21 @@ def make_predictions_pipeline(args):
     model.eval()
 
     # ============ make predictions ... ============
+    threshold = 0.5
+
     predicted_labels_all = []
     with tqdm(data_loader_val, unit="batch") as tepoch:
         for it, (images, labels) in enumerate(tepoch):
-            print(len(images))
-            print(len(labels))
-            print(images.shape)
-            # images = [torch.FloatTensor([im.cuda()]) for im in images]
-
             with torch.no_grad():
-                images = [im.cuda() for im in images]
-                predicted_labels, _ = model(images, is_student=True)
-                print(predicted_labels.shape)
-                print(predicted_labels)
-                predicted_labels_all.extend(predicted_labels)
+                _, predicted_labels = model(images.cuda(), is_student=True)
+                predicted_labels_all.extend([x.item() for x in predicted_labels])
 
-    print(predicted_labels_all.shape)
+    predicted_labels_all = np.array(predicted_labels_all)
     print(predicted_labels_all)
+    predicted_labels_all = np.where(predicted_labels_all <= threshold, 0, 1)
 
     test_labels = torch.tensor([s[-1] for s in dataset_val.samples]).long()
-    return predicted_labels, test_labels
+    return predicted_labels_all, test_labels.numpy()
 
 
 class ReturnIndexDataset(datasets.ImageFolder):
