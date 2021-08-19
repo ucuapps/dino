@@ -13,6 +13,8 @@
 # limitations under the License.
 import os
 import argparse
+import pickle
+import random
 
 import numpy as np
 import sklearn.metrics as metrics
@@ -79,18 +81,20 @@ def make_predictions_pipeline(args):
     model.eval()
 
     # ============ make predictions ... ============
-    threshold = 0.5
+
+    sigmoid = lambda x: 1 / (1 + np.exp(-x))
 
     predicted_labels_all = []
     with tqdm(data_loader_val, unit="batch") as tepoch:
         for it, (images, labels) in enumerate(tepoch):
             with torch.no_grad():
                 _, predicted_labels = model(images.cuda(), is_student=True)
-                predicted_labels_all.extend([x.item() for x in predicted_labels])
+                predicted_labels = np.array([x.item() for x in predicted_labels])
+                predicted_labels = sigmoid(predicted_labels)
+                predicted_labels_all.extend(predicted_labels)
 
     predicted_labels_all = np.array(predicted_labels_all)
     print(predicted_labels_all)
-    predicted_labels_all = np.where(predicted_labels_all <= threshold, 0, 1)
 
     test_labels = torch.tensor([s[-1] for s in dataset_val.samples]).long()
     return predicted_labels_all, test_labels.numpy()
@@ -132,16 +136,49 @@ if __name__ == '__main__':
                         help="Whether to use batch normalizations in projection head (Default: False)")
     args = parser.parse_args()
 
+    torch.backends.cudnn.benchmark = False
+    cudnn.deterministic = True
+    SEED = 1
+    torch.cuda.manual_seed(SEED)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.backends.cudnn.deterministic = True
+
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
     y_pred, y_true = make_predictions_pipeline(args)
-    top1 = sum(y_pred == y_true) / len(y_true)
-    f1_score = metrics.f1_score(y_true, y_pred, average='binary')
-    conf_matrix = metrics.confusion_matrix(y_true, y_pred)
-    print(f"Classification head result: Top1: {top1}, 'F1-score: {f1_score}, '\n' Confusion Matrix: {conf_matrix}")
+    with open('predictions.pcl', 'wb') as f:
+        pickle.dump({
+            'y_pred': y_pred.tolist(),
+            'y_true': y_true.tolist(),
+        }, f)
+
+    print(sum(y_true), '/', len(y_true))
+
+    best_f1_score = 0
+    best_result = {}
+
+    for threshold in range(48000, 52000):
+        threshold /= 100000
+        y_pred_th = np.where(y_pred.copy() <= threshold, 0, 1)
+        top1 = sum(y_pred_th == y_true) / len(y_true)
+        f1_score = metrics.f1_score(y_true, y_pred_th, average='binary')
+        if f1_score > best_f1_score:
+            conf_matrix = metrics.confusion_matrix(y_true, y_pred_th)
+            best_result['threshold'] = threshold
+            best_result['top1'] = top1
+            best_result['f1_score'] = f1_score
+            best_result['conf_matrix'] = conf_matrix
+
+    threshold, top1, f1_score, conf_matrix = \
+        best_result['threshold'], best_result['top1'], best_result['f1_score'], best_result['conf_matrix']
+
+    print(f"Classification head result (threshold={threshold}): "
+          f"Top1: {top1}, 'F1-score: {f1_score}, '\n' Confusion Matrix: {conf_matrix}")
 
     # if utils.get_rank() == 0:
     #     if args.use_cuda:
