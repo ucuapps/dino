@@ -76,7 +76,17 @@ def make_predictions_pipeline(args):
 
     model.cuda()
 
-    utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
+    # Loading weights
+    if args.arch in vits.__dict__.keys():
+        utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
+    else:
+        state_dict = torch.load(args.pretrained_weights, map_location="cpu")
+        if args.checkpoint_key is not None and args.checkpoint_key in state_dict:
+            print(f"Take key {args.checkpoint_key} in provided checkpoint dict")
+            state_dict = state_dict[args.checkpoint_key]
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        msg = model.load_state_dict(state_dict, strict=False)
+        print(msg)
 
     model.eval()
 
@@ -94,7 +104,7 @@ def make_predictions_pipeline(args):
                 predicted_labels_all.extend(predicted_labels)
 
     predicted_labels_all = np.array(predicted_labels_all)
-    print(predicted_labels_all)
+    print(np.max(predicted_labels_all))
 
     test_labels = torch.tensor([s[-1] for s in dataset_val.samples]).long()
     return predicted_labels_all, test_labels.numpy()
@@ -162,8 +172,7 @@ if __name__ == '__main__':
     best_f1_score = 0
     best_result = {}
 
-    for threshold in range(48000, 52000):
-        threshold /= 100000
+    for threshold in np.arange(0.05, 0.9, 0.005):
         y_pred_th = np.where(y_pred.copy() <= threshold, 0, 1)
         top1 = sum(y_pred_th == y_true) / len(y_true)
         f1_score = metrics.f1_score(y_true, y_pred_th, average='binary')
@@ -173,6 +182,7 @@ if __name__ == '__main__':
             best_result['top1'] = top1
             best_result['f1_score'] = f1_score
             best_result['conf_matrix'] = conf_matrix
+            best_f1_score = f1_score
 
     threshold, top1, f1_score, conf_matrix = \
         best_result['threshold'], best_result['top1'], best_result['f1_score'], best_result['conf_matrix']
